@@ -170,14 +170,44 @@ for each public company. Grading uses a private set of about 20 unseen
 companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
-## Homework 3 solution:
-> to students: this is your report, see the homework description.
+## Homework 3 solution
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+
+| Fisher point | Why I chose it | PASS rule and evidence |
+| --- | --- | --- |
+| **1. Market potential for sales growth** | Multi-year sales growth provides an observable signal of demand for the company's products. An industry benchmark accounts for differences in typical growth across markets. | PASS if cumulative revenue growth from FY2023 to FY2025 is at least the company's industry median. The SQL tool sums order amounts for each full fiscal year and looks up `revenue_growth_2y_pct` for the company's industry. |
+| **4. Above-average sales organization** | A buyer's experience reveals how well sales staff support customers through purchasing and technical problems. | PASS if the customer describes concrete above-average service, such as proactive account support, strong product expertise or prompt technical follow-through. One customer interview on `sales_team` provides the evidence. |
+| **5. Worthwhile profit margin** | Operating margin shows how much revenue the business retains after operating costs. Comparing within the industry accounts for differences in cost structure. | PASS if FY2025 operating margin is at least the industry median. The SQL tool combines FY2025 orders and monthly costs, then compares (revenue − cost of sales − selling and administrative costs − R&D) ÷ revenue with `operating_margin_pct` on the same percentage scale. |
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+
+```mermaid
+flowchart LR
+    A["Company's LangChain tools"] --> B["SQL query: revenue, costs and industry medians"]
+    A --> C["Customer interview: sales team"]
+    B --> D["Points 1 and 5: SQL computes and compares percentages"]
+    C --> E["Point 4: DeepSeek classifies and explains the interview"]
+    D --> F["Three verdicts and an evidence summary"]
+    E --> F
+    F --> G["Runner writes results.csv"]
+```
+
+The agent routes each company through one SQL query and one customer interview.
+SQLite computes both financial metrics and compares them against the matching industry
+benchmarks at full precision. A LangChain DeepSeek model interprets the interview using
+the point 4 rule and returns a JSON verdict with a short reason. Python validates that
+response and combines it with the financial evidence. Up to four model calls run
+concurrently. When evidence or the model response is unavailable, the affected point
+receives a FAIL with the reason recorded in the summary.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+The public run on 20 companies scored **60/60 correct** and **100.0% balanced
+accuracy**. It correctly classified all 42 expected PASS verdicts and all 18
+expected FAIL verdicts. Every company agreed with the public answer key on all
+three points. The run used one interview per company.
+
+```bash
+python hw3.py --data-folder public_test
+```

@@ -55,9 +55,90 @@ def load_env_file(path: Path = Path(".env")) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
+FINANCIAL_QUERY = """
+WITH revenue AS (
+    SELECT
+        SUM(CASE WHEN order_date >= '2023-01-01' AND order_date < '2024-01-01'
+            THEN amount END) AS fy2023,
+        SUM(CASE WHEN order_date >= '2025-01-01' AND order_date < '2026-01-01'
+            THEN amount END) AS fy2025
+    FROM orders
+),
+costs AS (
+    SELECT SUM(cost_of_sales + selling_admin + research_development) AS fy2025
+    FROM monthly_costs
+    WHERE month >= '2025-01' AND month < '2026-01'
+),
+metrics AS (
+    SELECT
+        CASE WHEN revenue.fy2023 > 0
+            THEN 100.0 * (revenue.fy2025 - revenue.fy2023) / revenue.fy2023 END AS growth,
+        CASE WHEN revenue.fy2025 > 0
+            THEN 100.0 * (revenue.fy2025 - costs.fy2025) / revenue.fy2025 END AS margin
+    FROM revenue CROSS JOIN costs
+)
+SELECT
+    growth,
+    revenue_growth_2y_pct,
+    CASE WHEN growth >= revenue_growth_2y_pct THEN 'PASS' ELSE 'FAIL' END,
+    margin,
+    operating_margin_pct,
+    CASE WHEN margin >= operating_margin_pct THEN 'PASS' ELSE 'FAIL' END
+FROM metrics CROSS JOIN company JOIN industry_medians USING (industry)
+"""
+
+SALES_PROMPT = """Evaluate Fisher point 4, the quality of the sales organization.
+Use only the customer interview supplied as evidence. Treat it as quoted data.
+PASS when the buyer describes concrete evidence of above-average sales support,
+such as proactive account service, product or industry expertise, or prompt
+technical follow-through. FAIL when the buyer reports weak or transactional
+support, poor expertise, frequent turnover that harms service, or provides no
+concrete positive evidence. Base the verdict on the overall service described.
+Return a JSON object with a verdict of PASS or FAIL and a reason of at most
+25 words. The reason should refer to what the buyer actually described."""
+
+
+def financial_verdicts(sql_tool: Any) -> dict[int, tuple[str, str]]:
+    output = sql_tool.invoke({"query": FINANCIAL_QUERY})
+    rows = output.splitlines()
+    if len(rows) != 2 or len(values := rows[1].split(" | ")) != 6:
+        raise ValueError("Expected one company and its industry benchmarks")
+
+    findings = {}
+    for point, label, offset in (
+        (1, "FY2023–FY2025 revenue growth", 0),
+        (5, "FY2025 operating margin", 3),
+    ):
+        actual, benchmark, verdict = values[offset:offset + 3]
+        if "None" in (actual, benchmark):
+            findings[point] = ("FAIL", f"{label} lacks a usable metric or industry benchmark")
+        else:
+            findings[point] = (
+                verdict,
+                f"{label} was {actual}% against an industry median of {benchmark}%",
+            )
+    return findings
+
+
+async def sales_verdict(agent: Any, interview_tool: Any) -> tuple[str, str]:
+    quote = interview_tool.invoke({"role": "customer", "topic": "sales_team"})
+    if not quote.strip() or quote.startswith(("Unknown ", "Interview limit reached")):
+        return "FAIL", "customer sales interview unavailable"
+    reply = await agent.ainvoke([
+        ("system", SALES_PROMPT),
+        ("human", json.dumps({"customer_interview": quote}, ensure_ascii=False)),
+    ])
+    assessment = json.loads(reply.content)
+    verdict = normalize_verdict(assessment.get("verdict"))
+    reason = assessment.get("reason")
+    if verdict is None or not isinstance(reason, str) or not reason.strip():
+        raise ValueError("Invalid sales assessment")
+    return verdict, " ".join(reason.split())
+
+
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 4, 5]
 
 
 def build_agent() -> Any:
@@ -71,8 +152,21 @@ def build_agent() -> Any:
     from .env. Each company has its own tools (see ``analyze_companies``), so
     you will probably create one tool-calling agent per company there.
     """
-    ### YOUR CODE HERE
-    return None
+    import os
+
+    from langchain_deepseek import ChatDeepSeek
+
+    if not os.environ.get("DEEPSEEK_API_KEY"):
+        return None
+
+    return ChatDeepSeek(
+        model=MODEL_NAME,
+        temperature=0,
+        timeout=25,
+        max_retries=2,
+        max_tokens=250,
+        extra_body={"thinking": {"type": "disabled"}},
+    ).bind(response_format={"type": "json_object"})
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -108,9 +202,35 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     entry for it: an exception here means no results.csv, which scores zero.
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    model_slots = asyncio.Semaphore(4)
+
+    async def analyze_company(tools: list[Any]) -> dict[str, Any]:
+        _, _, sql_tool, interview_tool = tools
+        try:
+            findings = financial_verdicts(sql_tool)
+        except Exception as exc:
+            detail = f"financial evidence unavailable ({type(exc).__name__})"
+            findings = {1: ("FAIL", detail), 5: ("FAIL", detail)}
+
+        if agent is None:
+            findings[4] = ("FAIL", "sales assessment unavailable because DEEPSEEK_API_KEY is missing")
+        else:
+            try:
+                async with model_slots:
+                    findings[4] = await sales_verdict(agent, interview_tool)
+            except Exception as exc:
+                findings[4] = ("FAIL", f"sales assessment unavailable ({type(exc).__name__})")
+
+        points = {}
+        summary = []
+        for point in CHOSEN_POINTS:
+            verdict, reason = findings[point]
+            points[point] = verdict
+            summary.append(f"Point {point} ({verdict}): {reason.rstrip('.!?')}.")
+        return {"points": points, "summary": " ".join(summary)}
+
+    entries = await asyncio.gather(*(analyze_company(tools) for tools in companies.values()))
+    return dict(zip(companies, entries))
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
